@@ -1,4 +1,6 @@
-# Import modules for the model to run
+# ResNet18 for binary classification task of Malignant vs Benign tumor detection
+#Import modules for the model to run
+
 import copy
 import random
 import time
