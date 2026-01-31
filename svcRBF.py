@@ -1,0 +1,201 @@
+#RBF SVM for binary classification task of Malignant vs Benign tumor detection
+#imports scikit tools framework
+#Imports modol support vector classifier
+import numpy as np
+import medmnist
+from medmnist import INFO
+from medmnist.dataset import BreastMNIST
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import confusion_matrix
+
+#definition of metrics, computes binary classification metrics from confussion metric
+#cmatrix is a 2*2 matrix , fun returns metrica
+def metrics_from_cm(cmatrix):
+    tn, fp, fn, tp = cmatrix.ravel()
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    acc = (tn + tp) / (tn + tp + fp + fn) if (tp + tn + fn + fp) else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0         # TNR for normal/benign
+    recall = tp / (tp + fn) if (tn + fp) else 0.0  # sensitivity for malignant
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    bal_acc = 0.5 * (recall + specificity)
+
+    return {
+        "accuracy": acc,
+        "precision": precision,
+        "recall_sensi": recall,
+        "specificity": specificity,
+        "f1": f1,
+        "balanced_accuracy": bal_acc,
+        "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+        "cmatrix": cmatrix,
+    }
+
+#prints metrics
+def print_report(tag, y_true, y_pred, label_names=None):
+    cmatrix = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    c = metrics_from_cm(cmatrix)
+
+    if label_names is None:
+        label_names = {0: "negative", 1: "positive"}
+
+    print(f"\n[{tag}] Confusion Matrix (rows=true, cols=pred), labels [0,1]:")
+    print(f"                 pred 0        pred 1")
+    print(f"true 0 ({label_names[0]:>12})   {c['tn']:8d}     {c['fp']:8d}")
+    print(f"true 1 ({label_names[1]:>12})   {c['fn']:8d}     {c['tp']:8d}")
+
+    print(
+        f"[{tag}] acc={c['acc']:.4f}  bal_acc={c['balanced_acc']:.4f}  "
+        f"prec={c['precision']:.4f}  sens/recall={c['recall_sens']:.4f}  "
+        f"spec={c['specificity']:.4f}  f1={c['f1']:.4f}"
+    )
+    return c
+
+def tune_threshold_on_val(scores, y, objective="balanced_acc"):
+    thresholds = np.unique(np.quantile(scores, np.linspace(0, 1, 401)))
+    best_t, best_s = thresholds[0], -1
+    for t in thresholds:
+        pred = (scores >= t).astype(int)
+        cmatrix = confusion_matrix(y, pred, labels=[0,1])
+        m = metrics_from_cm(cmatrix)
+        s = m["balanced_acc"] if objective == "balanced_acc" else m["f1"]
+        if s > best_s:
+            best_t, best_s = t, s
+    return best_t, best_s
+
+#perfoms augmentation, random translations with zero padding , shame ouptu shape as inpu
+def random_shift(img, max_shift=2, rng=None):
+    if rng is None:
+        rng = np.random.default_rng()
+    dv = int(rng.integers(-max_shift, max_shift + 1))  # vertical  shift
+    dh = int(rng.integers(-max_shift, max_shift + 1))  # horizontal  shift
+    H, W = img.shape
+    out = np.zeros_like(img)
+    y0_src = max(0, -dv); y1_src = min(H, H - dv)
+    x0_src = max(0, -dh); x1_src = min(W, W - dh)
+    y0_dst = max(0,  dv); y1_dst = min(H, H + dv)
+    x0_dst = max(0,  dh); x1_dst = min(W, W + dh)
+    out[y0_dst:y1_dst, x0_dst:x1_dst] = img[y0_src:y1_src, x0_src:x1_src]
+    return out
+def print_counts(label, y):
+    vals, counts = np.unique(y, return_counts=True)
+    print(f"{label} class counts:", dict(zip(vals.tolist(), counts.tolist())))
+
+
+
+#function augments images
+def aug_training_set(X, y, max_shift=2, seed=42, aug_pos=3, aug_neg=1):
+        rng = np.random.default_rng(seed)
+        y = y.reshape(-1).astype(int)
+        pos = np.where(y == 1)[0]
+        neg = np.where(y == 0)[0]
+        X_out, y_out = [X], [y]
+        for idxs, k in ((pos, aug_pos), (neg, aug_neg)):
+            for _ in range(int(k)):
+                X_out.append(np.stack([random_shift(X[i], max_shift=max_shift, rng=rng) for i in idxs]))
+                y_out.append(y[idxs])
+        return np.concatenate(X_out, axis=0), np.concatenate(y_out, axis =0)
+
+#transformations and normalisation, flattens image into 1D vector, flattens lables into (N,)
+def twod_label(imgs, labels):
+    X = imgs.reshape(len(imgs), -1)
+    Y = labels.reshape(-1).astype(int)
+    return X, Y
+
+# main definiton, uses preprocessing, scales features , reduce dimensionality , evaluates model
+def main():
+    np.random.seed(20) #makes random operations repeatable on operations that use NUMPY randomness
+    # Load dataset splits from imports
+    train_ds = BreastMNIST(split="train", download=True)
+    val_ds   = BreastMNIST(split="val",   download=True)
+    test_ds  = BreastMNIST(split="test",  download=True)
+
+    info = INFO["breastmnist"] # pulls label mapping from info
+    raw_label_map = {int(k): v for k, v in info["label"].items()}
+
+#converts breastminst images into 2D feature matrix for scilkit
+    Xtrian, ytrian = twod_label(train_ds.imgs, train_ds.labels)
+    Xval,  yval  = twod_label(val_ds.imgs,   val_ds.labels)
+    Xtest, ytest = twod_label(test_ds.imgs,  test_ds.labels)
+
+    ytrian = (ytrian == 0).astype(np.int64)
+    yval  = (yval  == 0).astype(np.int64)
+    ytest = (ytest == 0).astype(np.int64)
+
+#perfoms class augumentations of the training dataset, apllies shifts, flips, increases malignant samples by *4
+    Xtrian_aug, ytrian_aug = aug_training_set(
+        Xtrian, ytrian,
+        max_shift=2,
+        seed=18,
+        aug_pos=4,   # augment malignant more  to helps reduce bias)
+        aug_neg=1 # benign class kept the same
+    )
+#flattens images into feature vectors for scikit, 784 features
+    Xtr_f = Xtr_aug.reshape(len(Xtr_aug), -1)
+    Xv_f  = Xv.reshape(len(Xv), -1)
+    Xte_f = Xte.reshape(len(Xte), -1)
+
+#pipeline to apply a series of transformers, standardize fetaures, and train rbf svc non-classifier
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("pca", "passthrough"), # PCA diabled but enabled later in grid search
+        ("svm", SVC(kernel="rbf", class_weight="balanced")),
+    ])
+
+ #hyperameter search/tuning, uses 4-fold startified cross-validation and fits the model
+    cv = StratifiedKFold(n_splits=6, shuffle=True, random_state=18)
+    param_grid = [
+        {
+            "pca": [PCA(random_state=18)], # pca used
+            "pca__n_components": [37, 59, 120], #tries different pca dimensions, feature reduction
+            "svm__C": [0.2, 10, 10, 1000, 100], #tries differnt regularasation strehgnes
+            "svm__gamma": [1e-5, 1e-4, 1e-2, 1e-1, "scale"], #controls RBF DB demacartions
+        },
+        {
+            "pca": ["passthrough"], #pca not used
+            "svm__C": [0.2, 10, 10, 1000, 100],
+            "svm__gamma": [1e-5, 1e-4, 1e-2, 1e-1, "scale"],
+        }
+    ]
+#builds exhaustive search for best parameters
+    search = GridSearchCV(
+        estimator=pipe,
+        param_grid=param_grid,
+        scoring="balanced_accuracy",
+        cv=cv,
+        n_jobs=-1,
+        verbose=1,
+        refit=True,
+    )
+# runs search of best features and fits on training datatset
+    search.fit(Xtr_f, ytr_aug)
+
+    best_model = search.best_estimator_
+    print("\nBest CV score (balanced_accuracy):", search.best_score_)
+    print("Best params:", search.best_params_)
+
+    scores_val = best_model.decision_function(Xv_f)
+    thr, thr_score = tune_threshold_on_val(scores_val, yv, objective="balanced_acc")
+    print(f"\nThreshold tuned on VAL (maximize balanced_acc): thr={thr:.6f}, bal_acc={thr_score:.4f}")
+
+    val_pred = (scores_val >= thr).astype(int)
+    print_report("VAL", yv, val_pred, label_names=label_names)
+
+    Xtrv = np.concatenate([Xtr_aug, Xv], axis=0)
+    ytrv = np.concatenate([ytr_aug, yv], axis=0)
+    Xtrv_f = Xtrv.reshape(len(Xtrv), -1)
+
+    final_model = best_model
+    final_model.fit(Xtrv_f, ytrv)
+
+    scores_test = final_model.decision_function(Xte_f)
+    test_pred = (scores_test >= thr).astype(int)
+    print_report("TEST", yte, test_pred, label_names=label_names)
+
+    print(model)
+
+if __name__ == "__main__":
+    main()
